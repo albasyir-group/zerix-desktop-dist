@@ -1,0 +1,316 @@
+name: Build unsigned desktop installers
+
+on:
+  push:
+    tags:
+      - "zerix-v*"
+
+permissions: {}
+
+concurrency:
+  group: zerix-desktop-dist-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: albasyir-group/zerix-desktop
+
+jobs:
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      title: ${{ steps.tag.outputs.title }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Validate tag name
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^zerix-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Tag '$TAG' tidak valid; format wajib zerix-vX.Y.Z[-suffix]"
+            exit 1
+          fi
+          if printf '%s' "$TAG" | grep -Eq -- '-(rc|beta|alpha)'; then prerelease=true; else prerelease=false; fi
+          {
+            echo "tag=$TAG"
+            echo "title=Zerix Desktop $TAG (unsigned)"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG (prerelease=$prerelease)"
+      - name: Verify source tag
+        id: source
+        env:
+          DEPLOY_KEY: ${{ secrets.ZERIX_DESKTOP_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::Secret ZERIX_DESKTOP_DEPLOY_KEY belum di-set"
+            exit 1
+          fi
+          sshdir="$RUNNER_TEMP/source-ssh"
+          trap 'rm -rf "$sshdir"' EXIT
+          install -d -m 700 "$sshdir"
+          ( umask 077; printf '%s\n' "$DEPLOY_KEY" > "$sshdir/key" )
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$sshdir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $sshdir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$sshdir/known_hosts -o StrictHostKeyChecking=yes"
+          remote="git@github.com:$SOURCE_REPOSITORY.git"
+          if ! refs="$(git ls-remote --tags "$remote" "refs/tags/$TAG" "refs/tags/$TAG^{}")"; then
+            echo "::error::Gagal membaca source tag"
+            exit 1
+          fi
+          if [ -z "$refs" ]; then
+            echo "::error::Tag $TAG belum ada di zerix-desktop"
+            exit 1
+          fi
+          sha="$(printf '%s\n' "$refs" | awk -v p="refs/tags/$TAG^{}" '$2==p{print $1}')"
+          [ -n "$sha" ] || sha="$(printf '%s\n' "$refs" | awk -v p="refs/tags/$TAG" '$2==p{print $1}')"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::SHA commit untuk tag $TAG tidak valid"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Source: $TAG -> $sha"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Term guard (repo, title)
+        env:
+          TITLE: ${{ steps.tag.outputs.title }}
+        run: |
+          set -euo pipefail
+          node scripts/term-guard.mjs --repo . --text "planned title=$TITLE"
+
+  prepare-release:
+    name: Prepare release
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft release or reuse existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          TITLE: ${{ needs.resolve.outputs.title }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --json tagName >/dev/null 2>&1; then
+            echo "Release $TAG sudah ada"
+            exit 0
+          fi
+          flags=(--draft --verify-tag --title "$TITLE" --notes "Build in progress.")
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" "${flags[@]}"
+
+  build:
+    name: ${{ matrix.target }} (unsigned)
+    needs: [resolve, prepare-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: win-x64
+            runner: windows-2025
+            script: package:desktop:win:x64:unsigned
+            extension: exe
+            timeout: 180
+          - target: mac-arm64
+            runner: macos-15
+            script: package:desktop:mac:arm64:unsigned
+            extension: dmg
+            timeout: 120
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    environment: production
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      DSH_TELEMETRY_DISABLED: "1"
+      CI: "true"
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      DEFAULT_PLATFORM_ORIGIN: ${{ vars.DEFAULT_PLATFORM_ORIGIN }}
+      DEFAULT_INFERENCE_ORIGIN: ${{ vars.DEFAULT_INFERENCE_ORIGIN }}
+    steps:
+      - name: Validate origins
+        run: |
+          set -euo pipefail
+          for name in DEFAULT_PLATFORM_ORIGIN DEFAULT_INFERENCE_ORIGIN; do
+            value="${!name}"
+            if ! printf '%s' "$value" | grep -Eq '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'; then
+              echo "::error::$name kosong/tidak valid: '$value'"
+              exit 1
+            fi
+            echo "$name=$value"
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: dist-tools
+          persist-credentials: false
+      - name: Move helpers
+        run: |
+          set -euo pipefail
+          tmp="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")"
+          mkdir -p "$tmp/dist-tools"
+          cp -R dist-tools/scripts "$tmp/dist-tools/"
+          rm -rf dist-tools
+      - name: Checkout source tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          ssh-key: ${{ secrets.ZERIX_DESKTOP_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify source commit
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$SOURCE_SHA" ]; then
+            echo "::error::Checkout $actual != $SOURCE_SHA"
+            exit 1
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          expected="$(node -p "require('./package.json').packageManager.split('@')[1].split('+')[0]")"
+          test "$(pnpm --version)" = "$expected"
+          pnpm install --frozen-lockfile
+      - name: Configure Windows env
+        if: matrix.target == 'win-x64'
+        run: node "$RUNNER_TEMP/dist-tools/scripts/configure-windows-env.mjs"
+      - name: Configure tar
+        if: matrix.target == 'win-x64'
+        run: |
+          set -euo pipefail
+          echo "TAR_OPTIONS=--force-local" >> "$GITHUB_ENV"
+      - name: Preflight tar
+        if: matrix.target == 'win-x64'
+        run: node "$RUNNER_TEMP/dist-tools/scripts/tar-preflight.mjs"
+      - name: Validate target
+        run: pnpm run ${{ matrix.script }} --check
+      - name: Package and smoke-test
+        run: pnpm run ${{ matrix.script }}
+      - name: Verify origins in app bundle
+        run: |
+          set -euo pipefail
+          bundle=apps/desktop/lib/main.js
+          test -f "$bundle" || { echo "::error::$bundle tidak ada"; exit 1; }
+          for name in DEFAULT_PLATFORM_ORIGIN DEFAULT_INFERENCE_ORIGIN; do
+            value="${!name}"
+            if ! grep -qF "$value" "$bundle"; then
+              echo "::error::$name=$value tidak ter-bake di $bundle (source belum mendukung env build ini?)"
+              exit 1
+            fi
+          done
+          if grep -qF 'staging-platform' "$bundle"; then
+            echo "::error::build production memuat origin staging"
+            exit 1
+          fi
+          echo "Origins OK in $bundle"
+      - name: Stage installer
+        env:
+          DESKTOP_TARGET: ${{ matrix.target }}
+          DESKTOP_EXTENSION: ${{ matrix.extension }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: node "$RUNNER_TEMP/dist-tools/scripts/stage-installer.mjs"
+      - name: Term guard (staged files)
+        run: |
+          set -euo pipefail
+          stage="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")/zerix-stage"
+          args=()
+          for f in "$stage"/*; do
+            case "$f" in
+              *.txt|*.json) args+=(--file "staged=$f") ;;
+              *) args+=(--text "staged name=$(basename "$f")") ;;
+            esac
+          done
+          node "$RUNNER_TEMP/dist-tools/scripts/term-guard.mjs" "${args[@]}"
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd "$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")/zerix-stage"
+          ls -l
+          for f in ./*; do
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$f" --clobber; then break; fi
+              if [ "$attempt" = 5 ]; then echo "::error::upload $f gagal 5x"; exit 1; fi
+              echo "::warning::upload $f gagal (percobaan $attempt), ulang dalam $((attempt * 15))s"
+              sleep $((attempt * 15))
+            done
+          done
+
+  finalize:
+    name: Finalize release
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Merge SHA256SUMS and provenance
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/parts"
+          gh release download "$TAG" --dir "$RUNNER_TEMP/parts" --pattern 'sha256-*.txt' --pattern 'provenance-*.json' --clobber
+          node scripts/finalize-release.mjs "$RUNNER_TEMP/parts" "$RUNNER_TEMP/final"
+      - name: Term guard (SHA256SUMS, provenance, notes, repo)
+        run: |
+          set -euo pipefail
+          node scripts/term-guard.mjs --repo . \
+            --file "SHA256SUMS=$RUNNER_TEMP/final/SHA256SUMS" \
+            --file "provenance.json=$RUNNER_TEMP/final/provenance.json" \
+            --file "release notes=$RUNNER_TEMP/final/NOTES.md"
+      - name: Upload SHA256SUMS and provenance
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "$RUNNER_TEMP/final/SHA256SUMS" "$RUNNER_TEMP/final/provenance.json" --clobber
+          for f in "$RUNNER_TEMP"/parts/*; do gh release delete-asset "$TAG" "$(basename "$f")" --yes; done
+      - name: Term guard (release title, asset names)
+        run: |
+          set -euo pipefail
+          title="$(gh release view "$TAG" --json name --jq .name)"
+          args=(--text "release title=$title")
+          while IFS= read -r name; do args+=(--text "asset name=$name"); done \
+            < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+          node scripts/term-guard.mjs "${args[@]}"
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          latest=true; [ "$PRERELEASE" = true ] && latest=false
+          gh release edit "$TAG" --draft=false --prerelease="$PRERELEASE" --latest="$latest" \
+            --notes-file "$RUNNER_TEMP/final/NOTES.md"
+          gh release view "$TAG" --json tagName,isDraft,isPrerelease,url,assets \
+            --jq '{tagName,isDraft,isPrerelease,url,assets:[.assets[]|{name,size}]}'
