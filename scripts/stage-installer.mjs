@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path'
 const env = process.env
 const target = env.DESKTOP_TARGET
 const extension = env.DESKTOP_EXTENSION
-const expected = { 'win-x64': 'exe', 'mac-arm64': 'dmg' }
+const expected = { 'win-x64': 'exe', 'win-x64-msix': 'msix', 'mac-arm64': 'dmg' }
 if (expected[target] === undefined || expected[target] !== extension) throw new Error(`Invalid target/extension ${target}/${extension}`)
 if (!/^[0-9a-f]{40}$/u.test(env.SOURCE_SHA ?? '')) throw new Error('SOURCE_SHA missing/invalid')
 if (!/^zerix-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$/u.test(env.TAG ?? '')) throw new Error('TAG missing/invalid')
@@ -18,13 +18,17 @@ if (!origin.test(origins.platform ?? '') || !origin.test(origins.inference ?? ''
 const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
 if (head !== env.SOURCE_SHA) throw new Error(`Checked-out source ${head} differs from tag commit ${env.SOURCE_SHA}`)
 
-const source = resolve(`apps/desktop/.desktop-build/targets/${target}/unsigned-artifacts`)
-const installers = readdirSync(source).filter(name => name.endsWith(`-unsigned.${extension}`))
-if (installers.length !== 1) throw new Error(`Expected exactly one *-unsigned.${extension}; found ${installers.length}`)
+const store = target === 'win-x64-msix'
+const buildTarget = store ? 'win-x64' : target
+const source = resolve(`apps/desktop/.desktop-build/targets/${buildTarget}/${store ? 'artifacts' : 'unsigned-artifacts'}`)
+const installers = readdirSync(source).filter(name => store
+  ? name.endsWith(`.${extension}`) && statSync(join(source, name)).isFile()
+  : name.endsWith(`-unsigned.${extension}`))
+if (installers.length !== 1) throw new Error(`Expected exactly one ${store ? '' : '*-unsigned'}.${extension}; found ${installers.length}`)
 const built = installers[0]
 if (!statSync(join(source, built)).isFile()) throw new Error('Installer is not a regular file')
 
-const file = { 'win-x64': 'Zerix-Setup-x64.exe', 'mac-arm64': 'Zerix-arm64.dmg' }[target]
+const file = { 'win-x64': 'Zerix-Setup-x64.exe', 'win-x64-msix': 'Zerix-x64.msix', 'mac-arm64': 'Zerix-arm64.dmg' }[target]
 
 const output = resolve(env.RUNNER_TEMP, 'zerix-stage')
 mkdirSync(output, { recursive: true })
@@ -42,6 +46,7 @@ writeFileSync(join(output, `provenance-${target}.json`), JSON.stringify({
   size,
   sha256,
   signing: 'unsigned',
+  distribution: store ? 'microsoft-store' : 'github-release',
   autoUpdate: false,
   origins,
   source: { repository: env.SOURCE_REPOSITORY, tag: env.TAG, commit: env.SOURCE_SHA },
