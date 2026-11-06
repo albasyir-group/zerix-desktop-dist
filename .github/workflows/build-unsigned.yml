@@ -39,7 +39,9 @@ jobs:
             exit 1
           fi
           if printf '%s' "$TAG" | grep -Eq -- '-(rc|beta|alpha)'; then prerelease=true; else prerelease=false; fi
-          if printf '%s' "$TAG" | grep -Eq '^zerix-v[0-9]+\.[0-9]+\.[0-9]+$'; then store=true; else store=false; fi
+          # Stable and -rc.N tags try the Store MSIX; the msix job skips it when the source package.json is a
+          # prerelease, because MSIX versions are four numbers and the Store build rejects prereleases.
+          if printf '%s' "$TAG" | grep -Eq '^zerix-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then store=true; else store=false; fi
           {
             echo "tag=$TAG"
             echo "title=Zerix Desktop $TAG (unsigned)"
@@ -324,30 +326,49 @@ jobs:
             echo "::error::Checkout $actual != $SOURCE_SHA"
             exit 1
           fi
+      - name: Check Store version
+        id: storever
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' apps/desktop/package.json | head -n 1)"
+          [ -n "$version" ] || { echo "::error::no version in apps/desktop/package.json"; exit 1; }
+          case "$version" in
+            *-*) echo "::notice::apps/desktop is $version (prerelease): no Store MSIX for this tag"; echo "store=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Store MSIX for apps/desktop $version"; echo "store=true" >> "$GITHUB_OUTPUT" ;;
+          esac
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.storever.outputs.store == 'true'
         with:
           node-version: "24"
           package-manager-cache: false
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: steps.storever.outputs.store == 'true'
       - name: Install dependencies
+        if: steps.storever.outputs.store == 'true'
         run: |
           set -euo pipefail
           expected="$(node -p "require('./package.json').packageManager.split('@')[1].split('+')[0]")"
           test "$(pnpm --version)" = "$expected"
           pnpm install --frozen-lockfile
       - name: Configure Windows env
+        if: steps.storever.outputs.store == 'true'
         run: node "$RUNNER_TEMP/dist-tools/scripts/configure-windows-env.mjs"
       - name: Configure tar
+        if: steps.storever.outputs.store == 'true'
         run: |
           set -euo pipefail
           echo "TAR_OPTIONS=--force-local" >> "$GITHUB_ENV"
       - name: Preflight tar
+        if: steps.storever.outputs.store == 'true'
         run: node "$RUNNER_TEMP/dist-tools/scripts/tar-preflight.mjs"
       - name: Validate target
+        if: steps.storever.outputs.store == 'true'
         run: pnpm run package:desktop:win:msix --check
       - name: Package and smoke-test
+        if: steps.storever.outputs.store == 'true'
         run: pnpm run package:desktop:win:msix
       - name: Verify origins in app bundle
+        if: steps.storever.outputs.store == 'true'
         run: |
           set -euo pipefail
           bundle=apps/desktop/lib/main.js
@@ -365,12 +386,14 @@ jobs:
           fi
           echo "Origins OK in $bundle"
       - name: Stage installer
+        if: steps.storever.outputs.store == 'true'
         env:
           DESKTOP_TARGET: win-x64-msix
           DESKTOP_EXTENSION: msix
           RUNNER_LABEL: windows-2025
         run: node "$RUNNER_TEMP/dist-tools/scripts/stage-installer.mjs"
       - name: Term guard (staged files)
+        if: steps.storever.outputs.store == 'true'
         run: |
           set -euo pipefail
           stage="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")/zerix-stage"
@@ -383,6 +406,7 @@ jobs:
           done
           node "$RUNNER_TEMP/dist-tools/scripts/term-guard.mjs" "${args[@]}"
       - name: Upload MSIX artifact
+        if: steps.storever.outputs.store == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zerix-msix-${{ env.TAG }}
