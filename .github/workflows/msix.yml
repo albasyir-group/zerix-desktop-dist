@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: "Commit SHA (40 hex) di albasyir-group/zerix-desktop, biasanya HEAD master"
+        description: "Commit SHA (40 hex) di albasyir-group/zerix-desktop; wajib commit yang sama dengan Release zerix-v<versi> (EXE/DMG)"
         type: string
         required: true
 
@@ -43,6 +43,8 @@ jobs:
       DSH_TELEMETRY_DISABLED: "1"
       CI: "true"
       SOURCE_SHA: ${{ inputs.source_sha }}
+      # Wajib sama dengan nama yang di-reserve di Partner Center dan productName EXE/DMG di zerix-desktop
+      STORE_DISPLAY_NAME: Zerix
       DEFAULT_PLATFORM_ORIGIN: ${{ vars.DEFAULT_PLATFORM_ORIGIN }}
       DEFAULT_INFERENCE_ORIGIN: ${{ vars.DEFAULT_INFERENCE_ORIGIN }}
     steps:
@@ -108,6 +110,35 @@ jobs:
           fi
           echo "TAG=$label" >> "$GITHUB_ENV"
           echo "Label: $label"
+      - name: Verify version sync
+        env:
+          INPUT_LABEL: ${{ inputs.label }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./apps/desktop/package.json').version")"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Versi package '$version' bukan stabil X.Y.Z; Store menolak prerelease"
+            exit 1
+          fi
+          if [ -n "$INPUT_LABEL" ]; then
+            if [ "$INPUT_LABEL" != "zerix-v${version}" ]; then
+              echo "::error::Label '$INPUT_LABEL' != zerix-v${version}; versi tag wajib sama dengan versi package di source"
+              exit 1
+            fi
+          else
+            if ! prov="$(gh release download "zerix-v${version}" -R "$GITHUB_REPOSITORY" -p provenance.json -O -)"; then
+              echo "::error::Release zerix-v${version} tidak ditemukan; MSIX v${version} wajib dibuild dari commit yang sama dengan EXE/DMG di Release zerix-v${version}; fix khusus Store berarti bump versi lalu rilis baru."
+              exit 1
+            fi
+            release_commit="$(PROV="$prov" node -p "JSON.parse(process.env.PROV).source.commit")"
+            if [ "$release_commit" != "$SOURCE_SHA" ]; then
+              echo "::error::MSIX v${version} wajib dibuild dari commit yang sama dengan EXE/DMG di Release zerix-v${version} (${release_commit}); fix khusus Store berarti bump versi lalu rilis baru. source_sha=${SOURCE_SHA}"
+              exit 1
+            fi
+          fi
+          echo "MSIX_VERSION=$version" >> "$GITHUB_ENV"
+          echo "Versi sinkron: $version (commit $SOURCE_SHA)"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
@@ -154,6 +185,35 @@ jobs:
           DESKTOP_EXTENSION: msix
           RUNNER_LABEL: windows-2025
         run: node "$RUNNER_TEMP/dist-tools/scripts/stage-installer.mjs"
+      - name: Verify MSIX manifest (version + display name)
+        env:
+          MSIX_FILE_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          MSIX_PATH="$MSIX_FILE_DIR/zerix-stage/Zerix-x64.msix" python -c '
+          import os, sys, zipfile
+          import xml.etree.ElementTree as ET
+          path = os.environ["MSIX_PATH"]
+          expected = os.environ["MSIX_VERSION"] + ".0"
+          expected_name = os.environ["STORE_DISPLAY_NAME"]
+          with zipfile.ZipFile(path) as z:
+              root = ET.fromstring(z.read("AppxManifest.xml"))
+          def local(t): return t.rsplit("}", 1)[-1]
+          ident = next(e for e in root.iter() if local(e.tag) == "Identity")
+          props = next((e for e in root.iter() if local(e.tag) == "Properties"), None)
+          name = None
+          if props is not None:
+              name = next((e.text for e in props if local(e.tag) == "DisplayName"), None)
+          actual = ident.get("Version")
+          print("Identity Version:", actual)
+          print("DisplayName:", name)
+          if actual != expected:
+              print("::error::Identity Version %s != %s" % (actual, expected))
+              sys.exit(1)
+          if name != expected_name:
+              print("::error::DisplayName '%s' != '%s'; harus sama dengan nama yang di-reserve di Partner Center" % (name, expected_name))
+              sys.exit(1)
+          '
       - name: Term guard (staged files)
         run: |
           set -euo pipefail

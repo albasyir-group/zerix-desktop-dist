@@ -42,7 +42,7 @@ jobs:
           if printf '%s' "$TAG" | grep -Eq '^zerix-v[0-9]+\.[0-9]+\.[0-9]+$'; then store=true; else store=false; fi
           {
             echo "tag=$TAG"
-            echo "title=Zerix Desktop $TAG (unsigned)"
+            echo "title=Zerix $TAG (unsigned)"
             echo "prerelease=$prerelease"
             echo "store=$store"
           } >> "$GITHUB_OUTPUT"
@@ -188,6 +188,17 @@ jobs:
             echo "::error::Checkout $actual != $SOURCE_SHA"
             exit 1
           fi
+      - name: Verify package version matches tag
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./apps/desktop/package.json').version")"
+          tag_version="${TAG#zerix-v}"
+          tag_version="${tag_version%%-*}"
+          if [ "$version" != "$tag_version" ]; then
+            echo "::error::Versi package $version != versi tag $tag_version ($TAG)"
+            exit 1
+          fi
+          echo "Versi sinkron: $version ($TAG)"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"

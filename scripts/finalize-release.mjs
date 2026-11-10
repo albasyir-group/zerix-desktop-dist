@@ -30,7 +30,7 @@ writeFileSync(join(outDir, 'provenance.json'), JSON.stringify({
 
 const label = { 'win-x64': 'Windows x64 installer', 'mac-arm64': 'macOS Apple Silicon (arm64) disk image' }
 writeFileSync(join(outDir, 'NOTES.md'), [
-  `**Zerix Desktop ${tag} — UNSIGNED build**`,
+  `**Zerix ${tag} — UNSIGNED build**`,
   '',
   `Source: \`${tag}\` @ \`${sourceSha}\``,
   `Platform: ${first.origins.platform} · Inference: ${first.origins.inference}`,
