@@ -4,11 +4,23 @@ on:
   push:
     tags:
       - "zerix-v*"
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      store:
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      ZERIX_DESKTOP_DEPLOY_KEY:
+        required: true
 
 permissions: {}
 
 concurrency:
-  group: zerix-desktop-dist-${{ github.ref_name }}
+  group: zerix-desktop-dist-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -31,7 +43,8 @@ jobs:
       - name: Validate tag name
         id: tag
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          INPUT_STORE: ${{ inputs.store }}
         run: |
           set -euo pipefail
           if ! printf '%s' "$TAG" | grep -Eq '^zerix-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
@@ -40,6 +53,7 @@ jobs:
           fi
           if printf '%s' "$TAG" | grep -Eq -- '-(rc|beta|alpha)'; then prerelease=true; else prerelease=false; fi
           if printf '%s' "$TAG" | grep -Eq '^zerix-v[0-9]+\.[0-9]+\.[0-9]+$'; then store=true; else store=false; fi
+          if [ "$INPUT_STORE" = false ]; then store=false; fi
           {
             echo "tag=$TAG"
             echo "title=Zerix $TAG (unsigned)"
