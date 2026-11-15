@@ -1,0 +1,226 @@
+name: Build Docker image
+
+on:
+  push:
+    tags:
+      - "zerix-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag zerix-vX.Y.Z[-suffix] yang sudah ada, untuk build ulang dan push image"
+        type: string
+        required: true
+  pull_request:
+    paths:
+      - "docker/**"
+      - ".github/workflows/docker.yml"
+
+permissions: {}
+
+concurrency:
+  group: zerix-desktop-dist-docker-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: albasyir-group/zerix-desktop
+  IMAGE: ghcr.io/albasyir-group/zerix
+
+jobs:
+  image:
+    name: Docker image (linux/amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DEFAULT_PLATFORM_ORIGIN: ${{ vars.DEFAULT_PLATFORM_ORIGIN }}
+      DEFAULT_INFERENCE_ORIGIN: ${{ vars.DEFAULT_INFERENCE_ORIGIN }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag=""
+          case "$EVENT_NAME" in
+            push) tag="$REF_NAME" ;;
+            workflow_dispatch) tag="$INPUT_TAG" ;;
+          esac
+          push=false
+          latest=false
+          version=""
+          source_ref=master
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            if ! printf '%s' "$tag" | grep -Eq '^zerix-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+              echo "::error::Tag '$tag' tidak valid; format wajib zerix-vX.Y.Z[-suffix]"
+              exit 1
+            fi
+            version="${tag#zerix-v}"
+            push=true
+            source_ref="$tag"
+            if printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              latest=true
+            fi
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "push=$push"
+            echo "latest=$latest"
+            echo "source_ref=$source_ref"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag=$tag version=$version push=$push latest=$latest source_ref=$source_ref"
+      - name: Validate origins
+        run: |
+          set -euo pipefail
+          for name in DEFAULT_PLATFORM_ORIGIN DEFAULT_INFERENCE_ORIGIN; do
+            value="${!name}"
+            if ! printf '%s' "$value" | grep -Eq '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'; then
+              echo "::error::$name kosong/tidak valid: '$value'"
+              exit 1
+            fi
+            echo "$name=$value"
+          done
+      - name: Checkout dist repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: dist
+          persist-credentials: false
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ steps.resolve.outputs.source_ref }}
+          path: source
+          ssh-key: ${{ secrets.ZERIX_DESKTOP_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify source version
+        if: steps.resolve.outputs.push == 'true'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected="${VERSION%%-*}"
+          actual="$(node -p "require('./source/package.json').version")"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Versi package.json source ($actual) tidak sama dengan versi tag ($expected)"
+            exit 1
+          fi
+      - name: Term guard
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          node dist/scripts/term-guard.mjs --repo dist --text "image=${IMAGE}:${VERSION:-pr}"
+      - name: Build image
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            -f dist/docker/Dockerfile \
+            --build-context dist=dist/docker \
+            --build-arg "PLATFORM_ORIGIN=$DEFAULT_PLATFORM_ORIGIN" \
+            --build-arg "INFERENCE_ORIGIN=$DEFAULT_INFERENCE_ORIGIN" \
+            --build-arg "ZERIX_VERSION=${VERSION:-pr}" \
+            -t zerix:ci source
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          token=""
+          redact() { if [ -n "$token" ]; then sed "s/$token/***/g"; else cat; fi; }
+          cleanup() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::group::docker logs"
+              docker logs zerix-smoke 2>&1 | redact || true
+              echo "::endgroup::"
+            fi
+            docker rm -f zerix-smoke >/dev/null 2>&1 || true
+            exit "$rc"
+          }
+          trap cleanup EXIT
+          fail() { echo "::error::$1"; exit 1; }
+
+          docker run -d --name zerix-smoke -p 127.0.0.1:4719:4719 zerix:ci >/dev/null
+
+          url=""
+          for _ in $(seq 1 120); do
+            url="$(docker logs zerix-smoke 2>&1 | grep -Eo 'http://localhost:4719/\?token=[^[:space:]]+' | head -n 1 || true)"
+            [ -n "$url" ] && break
+            if [ "$(docker inspect -f '{{.State.Running}}' zerix-smoke)" != "true" ]; then
+              fail "Container berhenti sebelum server siap"
+            fi
+            sleep 1
+          done
+          [ -n "$url" ] || fail "Server tidak siap dalam 120 detik (URL token tidak muncul di log)"
+          token="${url##*token=}"
+          echo "::add-mask::$token"
+
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4719/)"
+          [ "$code" = "401" ] || fail "Request tanpa token harus 401, dapat $code"
+
+          jar="$(mktemp)"
+          body="$(mktemp)"
+          code="$(curl -s -L -c "$jar" -b "$jar" -o "$body" -w '%{http_code}' "$url")"
+          [ "$code" = "200" ] || fail "Request dengan token harus berakhir 200, dapat $code"
+          grep -qF '<title>Zerix</title>' "$body" || fail "HTML tidak memuat <title>Zerix</title>"
+
+          uid="$(docker exec zerix-smoke id -u)"
+          [ "$uid" != "0" ] || fail "Container berjalan sebagai root"
+          docs="$(docker exec zerix-smoke sh -c 'xdg-user-dir DOCUMENTS')"
+          [ "$docs" = "/data/Documents" ] || fail "xdg-user-dir DOCUMENTS = '$docs', seharusnya /data/Documents"
+          out="$(docker exec zerix-smoke bash -c 'echo ok')"
+          [ "$out" = "ok" ] || fail "bash tidak berfungsi di container"
+
+          size="$(docker image inspect -f '{{.Size}}' zerix:ci)"
+          echo "Ukuran image: $((size / 1000000)) MB"
+          echo "Smoke test OK"
+      - name: Push image
+        if: steps.resolve.outputs.push == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          LATEST: ${{ steps.resolve.outputs.latest }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag zerix:ci "$IMAGE:$VERSION"
+          docker push "$IMAGE:$VERSION"
+          if [ "$LATEST" = "true" ]; then
+            docker tag zerix:ci "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+      - name: Job summary
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          PUSH: ${{ steps.resolve.outputs.push }}
+          LATEST: ${{ steps.resolve.outputs.latest }}
+        run: |
+          set -euo pipefail
+          size="$(docker image inspect -f '{{.Size}}' zerix:ci)"
+          {
+            echo "## Image Docker Zerix"
+            echo
+            if [ "$PUSH" = "true" ]; then
+              echo "- Tag: \`$IMAGE:$VERSION\`"
+              if [ "$LATEST" = "true" ]; then
+                echo "- Tag: \`$IMAGE:latest\`"
+              fi
+            else
+              echo "- Build pull request: image tidak di-push"
+            fi
+            echo "- Ukuran: $((size / 1000000)) MB"
+            echo
+            echo "Jalankan:"
+            echo
+            echo '```'
+            echo "docker run -it --rm -p 127.0.0.1:4719:4719 -v zerix-data:/data $IMAGE:${VERSION:-<versi>}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
