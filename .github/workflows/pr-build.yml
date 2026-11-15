@@ -1,0 +1,282 @@
+name: PR build (test, unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Nomor PR di zerix-desktop"
+        type: string
+        required: true
+      origin:
+        description: "Origin backend yang di-bake ke build"
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+permissions: {}
+
+concurrency:
+  group: zerix-desktop-dist-pr-build-${{ inputs.pr }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPOSITORY: albasyir-group/zerix-desktop
+
+jobs:
+  resolve:
+    name: Resolve PR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      pr: ${{ steps.pr.outputs.pr }}
+      sha: ${{ steps.source.outputs.sha }}
+      short: ${{ steps.source.outputs.short }}
+    steps:
+      - name: Validate PR number
+        id: pr
+        env:
+          PR_INPUT: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          pr="$(printf '%s' "$PR_INPUT" | tr -d '[:space:]')"
+          if ! printf '%s' "$pr" | grep -Eq '^[1-9][0-9]{0,5}$'; then
+            echo "::error::Nomor PR tidak valid; wajib angka 1-6 digit tanpa awalan 0"
+            exit 1
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "PR: $pr"
+      - name: Verify source PR head
+        id: source
+        env:
+          DEPLOY_KEY: ${{ secrets.ZERIX_DESKTOP_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.pr }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::Secret ZERIX_DESKTOP_DEPLOY_KEY belum di-set"
+            exit 1
+          fi
+          sshdir="$RUNNER_TEMP/source-ssh"
+          trap 'rm -rf "$sshdir"' EXIT
+          install -d -m 700 "$sshdir"
+          ( umask 077; printf '%s\n' "$DEPLOY_KEY" > "$sshdir/key" )
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$sshdir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $sshdir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$sshdir/known_hosts -o StrictHostKeyChecking=yes"
+          remote="git@github.com:$SOURCE_REPOSITORY.git"
+          if ! refs="$(git ls-remote "$remote" "refs/pull/$PR/head")"; then
+            echo "::error::Gagal membaca PR di source"
+            exit 1
+          fi
+          if [ -z "$refs" ]; then
+            echo "::error::PR #$PR tidak ditemukan di zerix-desktop"
+            exit 1
+          fi
+          sha="$(printf '%s\n' "$refs" | awk -v p="refs/pull/$PR/head" '$2==p{print $1}')"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::SHA commit untuk PR #$PR tidak valid"
+            exit 1
+          fi
+          {
+            echo "sha=$sha"
+            echo "short=${sha:0:12}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source: PR #$PR -> $sha"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Term guard (repo)
+        run: |
+          set -euo pipefail
+          node scripts/term-guard.mjs --repo .
+
+  build:
+    name: ${{ matrix.target }} (unsigned, test)
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: win-x64
+            runner: windows-2025
+            script: package:desktop:win:x64:unsigned
+            extension: exe
+            timeout: 180
+          - target: mac-arm64
+            runner: macos-15
+            script: package:desktop:mac:arm64:unsigned
+            extension: dmg
+            timeout: 120
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    environment: ${{ inputs.origin == 'production' && 'production' || '' }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      DSH_TELEMETRY_DISABLED: "1"
+      CI: "true"
+      SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+      PR: ${{ needs.resolve.outputs.pr }}
+      SHORT: ${{ needs.resolve.outputs.short }}
+      ORIGIN_CHOICE: ${{ inputs.origin }}
+      DEFAULT_PLATFORM_ORIGIN: ${{ inputs.origin == 'production' && vars.DEFAULT_PLATFORM_ORIGIN || 'https://staging-platform.foreasy.life' }}
+      DEFAULT_INFERENCE_ORIGIN: ${{ inputs.origin == 'production' && vars.DEFAULT_INFERENCE_ORIGIN || 'https://staging-platform-api.foreasy.life' }}
+    steps:
+      - name: Validate origins
+        run: |
+          set -euo pipefail
+          for name in DEFAULT_PLATFORM_ORIGIN DEFAULT_INFERENCE_ORIGIN; do
+            value="${!name}"
+            if ! printf '%s' "$value" | grep -Eq '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'; then
+              echo "::error::$name kosong/tidak valid: '$value'"
+              exit 1
+            fi
+            echo "$name=$value"
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: dist-tools
+          persist-credentials: false
+      - name: Move helpers
+        run: |
+          set -euo pipefail
+          tmp="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")"
+          mkdir -p "$tmp/dist-tools"
+          cp -R dist-tools/scripts "$tmp/dist-tools/"
+          rm -rf dist-tools
+      - name: Checkout source PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          ssh-key: ${{ secrets.ZERIX_DESKTOP_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify source commit
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$SOURCE_SHA" ]; then
+            echo "::error::Checkout $actual != $SOURCE_SHA"
+            exit 1
+          fi
+      - name: Set test label
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./apps/desktop/package.json').version")"
+          version="${version%%-*}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Versi package '$version' tidak valid"
+            exit 1
+          fi
+          tag="zerix-v${version}-pr${PR}.${SHORT}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "Label: $tag"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          expected="$(node -p "require('./package.json').packageManager.split('@')[1].split('+')[0]")"
+          test "$(pnpm --version)" = "$expected"
+          pnpm install --frozen-lockfile
+      - name: Configure Windows env
+        if: matrix.target == 'win-x64'
+        run: node "$RUNNER_TEMP/dist-tools/scripts/configure-windows-env.mjs"
+      - name: Configure tar
+        if: matrix.target == 'win-x64'
+        run: |
+          set -euo pipefail
+          echo "TAR_OPTIONS=--force-local" >> "$GITHUB_ENV"
+      - name: Preflight tar
+        if: matrix.target == 'win-x64'
+        run: node "$RUNNER_TEMP/dist-tools/scripts/tar-preflight.mjs"
+      - name: Validate target
+        run: pnpm run ${{ matrix.script }} --check
+      - name: Package and smoke-test
+        run: pnpm run ${{ matrix.script }}
+      - name: Verify origins in app bundle
+        run: |
+          set -euo pipefail
+          bundle=apps/desktop/lib/main.js
+          test -f "$bundle" || { echo "::error::$bundle tidak ada"; exit 1; }
+          for name in DEFAULT_PLATFORM_ORIGIN DEFAULT_INFERENCE_ORIGIN; do
+            value="${!name}"
+            if ! grep -qF "$value" "$bundle"; then
+              echo "::error::$name=$value tidak ter-bake di $bundle (source belum mendukung env build ini?)"
+              exit 1
+            fi
+          done
+          if [ "$ORIGIN_CHOICE" = production ] && grep -qF 'staging-platform' "$bundle"; then
+            echo "::error::build production memuat origin staging"
+            exit 1
+          fi
+          echo "Origins OK in $bundle"
+      - name: Stage installer
+        env:
+          DESKTOP_TARGET: ${{ matrix.target }}
+          DESKTOP_EXTENSION: ${{ matrix.extension }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: node "$RUNNER_TEMP/dist-tools/scripts/stage-installer.mjs"
+      - name: Term guard (staged files)
+        run: |
+          set -euo pipefail
+          stage="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")/zerix-stage"
+          args=()
+          for f in "$stage"/*; do
+            case "$f" in
+              *.txt|*.json) args+=(--file "staged=$f") ;;
+              *) args+=(--text "staged name=$(basename "$f")") ;;
+            esac
+          done
+          node "$RUNNER_TEMP/dist-tools/scripts/term-guard.mjs" "${args[@]}"
+      - name: Upload test artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zerix-test-pr${{ needs.resolve.outputs.pr }}-${{ needs.resolve.outputs.short }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/zerix-stage
+          retention-days: 3
+          if-no-files-found: error
+
+  summary:
+    name: Summary
+    needs: [resolve, build]
+    if: ${{ always() && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Write summary
+        env:
+          PR: ${{ needs.resolve.outputs.pr }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+          ORIGIN_CHOICE: ${{ inputs.origin }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Build tes PR #$PR"
+            echo
+            echo "- PR: #$PR"
+            echo "- Source SHA: \`$SOURCE_SHA\`"
+            echo "- Origin: $ORIGIN_CHOICE"
+            echo "- Hasil build: $BUILD_RESULT"
+            echo "- Artifact:"
+            echo "  - \`zerix-test-pr$PR-$SHORT-win-x64\`"
+            echo "  - \`zerix-test-pr$PR-$SHORT-mac-arm64\`"
+            echo "- Run: $RUN_URL"
+            echo
+            echo "Build tes unsigned, bukan rilis. Artifact kehapus otomatis 3 hari."
+          } >> "$GITHUB_STEP_SUMMARY"
