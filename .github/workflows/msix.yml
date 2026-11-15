@@ -14,15 +14,15 @@ on:
         required: true
   workflow_dispatch:
     inputs:
-      source_sha:
-        description: "Commit SHA (40 hex) di albasyir-group/zerix-desktop; wajib commit yang sama dengan Release zerix-v<versi> (EXE/DMG)"
+      version:
+        description: "Versi yang SUDAH dirilis (contoh 0.4.1); commit diambil otomatis dari provenance.json Release zerix-v<versi>"
         type: string
         required: true
 
 permissions: {}
 
 concurrency:
-  group: zerix-desktop-dist-msix-${{ inputs.source_sha }}
+  group: zerix-desktop-dist-msix-${{ inputs.source_sha || inputs.version }}
   cancel-in-progress: false
 
 env:
@@ -42,17 +42,41 @@ jobs:
     env:
       DSH_TELEMETRY_DISABLED: "1"
       CI: "true"
-      SOURCE_SHA: ${{ inputs.source_sha }}
       # Wajib sama dengan nama yang di-reserve di Partner Center dan productName EXE/DMG di zerix-desktop
       STORE_DISPLAY_NAME: Zerix
       DEFAULT_PLATFORM_ORIGIN: ${{ vars.DEFAULT_PLATFORM_ORIGIN }}
       DEFAULT_INFERENCE_ORIGIN: ${{ vars.DEFAULT_INFERENCE_ORIGIN }}
     steps:
+      - name: Resolve source commit
+        id: resolve
+        env:
+          INPUT_SHA: ${{ inputs.source_sha }}
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_SHA" ]; then
+            sha="$INPUT_SHA"
+          else
+            version="$(printf '%s' "$INPUT_VERSION" | tr -d '[:space:]')"
+            if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Versi '$version' tidak valid; format wajib X.Y.Z (stabil)"
+              exit 1
+            fi
+            if ! prov="$(gh release download "zerix-v${version}" -R "$GITHUB_REPOSITORY" -p provenance.json -O -)"; then
+              echo "::error::Release zerix-v${version} atau provenance.json tidak ditemukan; rilis versi ini dulu lewat workflow Release"
+              exit 1
+            fi
+            sha="$(PROV="$prov" node -p "JSON.parse(process.env.PROV).source.commit")"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_SHA=$sha" >> "$GITHUB_ENV"
+          echo "Source commit: $sha"
       - name: Validate input
         run: |
           set -euo pipefail
           if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::source_sha tidak valid; wajib 40 karakter hex huruf kecil"
+            echo "::error::SHA commit sumber tidak valid; wajib 40 karakter hex huruf kecil"
             exit 1
           fi
       - name: Validate origins
@@ -81,7 +105,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ steps.resolve.outputs.sha }}
           ssh-key: ${{ secrets.ZERIX_DESKTOP_DEPLOY_KEY }}
           fetch-depth: 1
           persist-credentials: false

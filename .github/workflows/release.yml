@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versi, contoh 0.4.1 atau 0.5.0-rc.1, tanpa awalan zerix-v"
+        type: string
+        required: true
+      store:
+        description: "Build MSIX Microsoft Store (hanya versi stabil X.Y.Z)"
+        type: boolean
+        default: true
+      source_ref:
+        description: "Branch zerix-desktop yang dirilis. Diabaikan kalau tag zerix-v<versi> sudah ada di zerix-desktop."
+        type: string
+        default: master
+
+permissions: {}
+
+concurrency:
+  group: zerix-desktop-dist-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: albasyir-group/zerix-desktop
+
+jobs:
+  tag:
+    name: Tag source and dist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+    steps:
+      - name: Validate input
+        id: validate
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Workflow Release wajib dijalankan dari branch main (sekarang: $GITHUB_REF)"
+            exit 1
+          fi
+          version="$(printf '%s' "$INPUT_VERSION" | tr -d '[:space:]')"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Versi '$version' tidak valid; format wajib X.Y.Z[-suffix], tanpa awalan zerix-v"
+            exit 1
+          fi
+          source_ref="$(printf '%s' "$INPUT_SOURCE_REF" | tr -d '[:space:]')"
+          if [ -z "$source_ref" ] || ! printf '%s' "$source_ref" | grep -Eq '^[A-Za-z0-9._/-]+$' || printf '%s' "$source_ref" | grep -Fq '..'; then
+            echo "::error::source_ref '$source_ref' tidak valid; wajib nama branch yang aman"
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=zerix-v$version"
+            echo "source_ref=$source_ref"
+          } >> "$GITHUB_OUTPUT"
+      - name: Check existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if info="$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [ "$info" != true ]; then
+              echo "::error::$TAG sudah dirilis; bump versi untuk rilis baru"
+              exit 1
+            fi
+            echo "Draft Release $TAG sudah ada (percobaan sebelumnya gagal); lanjut"
+          fi
+      - name: Resolve and tag source
+        id: source
+        env:
+          DEPLOY_KEY: ${{ secrets.ZERIX_DESKTOP_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          TAG: ${{ steps.validate.outputs.tag }}
+          SOURCE_REF: ${{ steps.validate.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::Secret ZERIX_DESKTOP_DEPLOY_KEY belum di-set"
+            exit 1
+          fi
+          sshdir="$RUNNER_TEMP/source-ssh"
+          workdir="$RUNNER_TEMP/source-verify"
+          trap 'rm -rf "$sshdir" "$workdir"' EXIT
+          install -d -m 700 "$sshdir"
+          ( umask 077; printf '%s\n' "$DEPLOY_KEY" > "$sshdir/key" )
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$sshdir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $sshdir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$sshdir/known_hosts -o StrictHostKeyChecking=yes"
+          remote="git@github.com:$SOURCE_REPOSITORY.git"
+
+          if ! refs="$(git ls-remote --tags "$remote" "refs/tags/$TAG" "refs/tags/$TAG^{}")"; then
+            echo "::error::Gagal membaca source tag"
+            exit 1
+          fi
+          tag_exists=false
+          if [ -n "$refs" ]; then
+            tag_exists=true
+            sha="$(printf '%s\n' "$refs" | awk -v p="refs/tags/$TAG^{}" '$2==p{print $1}')"
+            [ -n "$sha" ] || sha="$(printf '%s\n' "$refs" | awk -v p="refs/tags/$TAG" '$2==p{print $1}')"
+            echo "::notice::Tag $TAG sudah ada di zerix-desktop; source_ref diabaikan"
+          else
+            if ! heads="$(git ls-remote --heads "$remote" "refs/heads/$SOURCE_REF")"; then
+              echo "::error::Gagal membaca branch $SOURCE_REF"
+              exit 1
+            fi
+            sha="$(printf '%s\n' "$heads" | awk -v p="refs/heads/$SOURCE_REF" '$2==p{print $1}')"
+            if [ -z "$sha" ]; then
+              echo "::error::Branch $SOURCE_REF tidak ada di zerix-desktop"
+              exit 1
+            fi
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::SHA commit sumber tidak valid"
+            exit 1
+          fi
+
+          mkdir -p "$workdir"
+          cd "$workdir"
+          git init -q .
+          git fetch -q --depth 1 "$remote" "$sha"
+          pkg="$(git show FETCH_HEAD:apps/desktop/package.json)"
+          actual="$(PKG="$pkg" node -p "JSON.parse(process.env.PKG).version")"
+          expected="${VERSION%%-*}"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::apps/desktop/package.json di $sha versinya $actual, bukan $expected; merge PR bump versi dulu"
+            exit 1
+          fi
+
+          if [ "$tag_exists" = false ]; then
+            if ! git push -q "$remote" "$sha:refs/tags/$TAG"; then
+              echo "::error::Gagal push tag ke zerix-desktop; deploy key ZERIX_DESKTOP_DEPLOY_KEY kemungkinan read-only (perlu Allow write access), atau push tag manual lalu jalankan ulang"
+              exit 1
+            fi
+            echo "Tag $TAG dibuat di zerix-desktop -> $sha"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Tag dist repo
+        id: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if dist_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha' 2>/dev/null)"; then
+            echo "Tag $TAG sudah ada di repo ini -> $dist_sha (dipertahankan)"
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" >/dev/null
+            dist_sha="$GITHUB_SHA"
+            echo "Tag $TAG dibuat di repo ini -> $dist_sha"
+          fi
+          echo "sha=$dist_sha" >> "$GITHUB_OUTPUT"
+      - name: Summary
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          DIST_SHA: ${{ steps.dist.outputs.sha }}
+          STORE: ${{ inputs.store }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Release $TAG"
+            echo "- Tag: \`$TAG\`"
+            echo "- Source sha: \`$SOURCE_SHA\`"
+            echo "- Dist sha: \`$DIST_SHA\`"
+            echo "- Store MSIX: $STORE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    needs: tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-unsigned.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+      store: ${{ inputs.store }}
+    secrets:
+      ZERIX_DESKTOP_DEPLOY_KEY: ${{ secrets.ZERIX_DESKTOP_DEPLOY_KEY }}
